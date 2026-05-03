@@ -1,426 +1,321 @@
 import json
-from datetime import datetime
-from flask import Blueprint, request, session, redirect, url_for, jsonify, make_response
+import random as rnd
+from flask import Blueprint, request, session, redirect, url_for, jsonify
 
 from database import get_db
 from helpers import render, sidebar
 from auth_utils import login_required, role_required
 
-teacher_bp = Blueprint("teacher", __name__)
+student_bp = Blueprint("student", __name__)
 
-@teacher_bp.route("/teacher")
-@teacher_bp.route("/teacher/")
+# ─────────────────────────────────────────────
+# PAGE ROUTES
+# ─────────────────────────────────────────────
+
+@student_bp.route("/student")
+@student_bp.route("/student/")
 @login_required
-@role_required("teacher")
-def teacher_dashboard():
+@role_required("student")
+def student_dashboard():
     db = get_db()
-    tid = session.get("user_id")
-    try:
-        stats = {
-            "exams": db.execute("SELECT COUNT(*) FROM exams WHERE teacher_id=?", (tid,)).fetchone()[0],
-            "students": db.execute("""SELECT COUNT(DISTINCT student_id) FROM results r 
-                JOIN exams e ON r.exam_id=e.id WHERE e.teacher_id=?""", (tid,)).fetchone()[0],
-            "results": db.execute("""SELECT COUNT(*) FROM results r 
-                JOIN exams e ON r.exam_id=e.id WHERE e.teacher_id=?""", (tid,)).fetchone()[0],
-            "essays": db.execute("""SELECT COUNT(*) FROM student_answers sa
-                JOIN questions q ON sa.question_id=q.id
-                JOIN exams e ON q.exam_id=e.id
-                WHERE e.teacher_id=? AND q.type='essay'
-                  AND sa.answer IS NOT NULL AND sa.answer!=''
-                  AND NOT EXISTS(SELECT 1 FROM essay_reviews er WHERE er.answer_id=sa.id)""",
-                (tid,)).fetchone()[0],
-        }
-        recent_exams = db.execute("""
-            SELECT e.*, c.course_name,
-                   (SELECT COUNT(*) FROM results r WHERE r.exam_id=e.id) AS submissions
-            FROM exams e JOIN courses c ON e.course_id=c.id
-            WHERE e.teacher_id=? ORDER BY e.id DESC LIMIT 5""", (tid,)).fetchall()
-    finally:
-        db.close()
+    sid = session["user_id"]
 
-    exam_rows = "".join(f"""
-        <tr>
-            <td>{e['title']}</td>
-            <td>{e['course_name']}</td>
-            <td>{e['timer_minutes']} min</td>
-            <td>{e['submissions']}</td>
-            <td><a href="/teacher/exams/{e['id']}/results" class="btn btn-sm btn-secondary">View</a></td>
-        </tr>""" for e in recent_exams)
+    # Get IDs of exams already taken
+    taken_ids = [r["exam_id"] for r in db.execute(
+        "SELECT exam_id FROM results WHERE student_id=?", (sid,)).fetchall()]
 
-    html = sidebar("teacher", "dashboard") + f"""
-    <div class="topbar">
-      <div>
-        <div class="page-title">Teacher Dashboard</div>
-        <div class="page-sub">Welcome, {session.get('name', 'Teacher')}</div>
-      </div>
-      <a href="/teacher/exams/create" class="btn btn-primary">+ Create Exam</a>
-    </div>
-    <div class="grid grid-4" style="margin-bottom:24px">
-      <div class="stat-card"><div class="stat-icon" style="background:#c0392b"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2"/></svg></div><div><div class="stat-label">My Exams</div><div class="stat-value">{stats['exams']}</div></div></div>
-      <div class="stat-card"><div class="stat-icon" style="background:#2980b9"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2M9 7a4 4 0 100 8 4 4 0 000-8z"/></svg></div><div><div class="stat-label">Students Tested</div><div class="stat-value">{stats['students']}</div></div></div>
-      <div class="stat-card"><div class="stat-icon" style="background:#27ae60"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4"/></svg></div><div><div class="stat-label">Submissions</div><div class="stat-value">{stats['results']}</div></div></div>
-      <div class="stat-card"><div class="stat-icon" style="background:#f39c12"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5"/></svg></div><div><div class="stat-label">Pending Essays</div><div class="stat-value">{stats['essays']}</div></div></div>
-    </div>
-    <div class="card">
-      <div class="card-header"><h3 class="card-title">Recent Exams</h3><a href="/teacher/exams" class="btn btn-sm btn-secondary">View All</a></div>
-      <div class="table-wrap"><table><thead><tr><th>Exam Title</th><th>Course</th><th>Duration</th><th>Submissions</th><th>Actions</th></tr></thead>
-      <tbody>{exam_rows or '<tr><td colspan="5"><div class="empty-state"><div class="empty-icon">📝</div><p>No exams yet.</p></div></td></tr>'}</tbody></table></div>
-    </div></main></div>"""
-    return render(html, "Teacher Dashboard")
+    # Fetch available exams not yet taken
+    available = db.execute(
+        """SELECT e.*, c.course_name FROM exams e
+           JOIN courses c ON e.course_id=c.id
+           WHERE e.id NOT IN ({}) AND e.is_active=1
+           ORDER BY e.id DESC""".format(
+            ",".join(str(i) for i in taken_ids) if taken_ids else "0"
+        )
+    ).fetchall()
 
-
-@teacher_bp.route("/teacher/exams")
-@login_required
-@role_required("teacher")
-def teacher_exams():
-    db = get_db()
-    try:
-        exams = db.execute("""
-            SELECT e.*, c.course_name,
-                   (SELECT COUNT(*) FROM results r WHERE r.exam_id=e.id) AS submissions,
-                   (SELECT COUNT(*) FROM questions q WHERE q.exam_id=e.id) AS q_count
-            FROM exams e JOIN courses c ON e.course_id=c.id
-            WHERE e.teacher_id=? ORDER BY e.id DESC""", (session["user_id"],)).fetchall()
-    finally:
-        db.close()
-
-    rows = "".join(f"""
-        <tr>
-            <td>{e['title']}</td><td>{e['course_name']}</td>
-            <td>{e['q_count']} Qs</td><td>{e['timer_minutes']} min</td><td>{e['submissions']}</td>
-            <td><div class="flex gap-4">
-                <a href="/teacher/exams/{e['id']}/edit" class="btn btn-sm btn-warning">Edit</a>
-                <a href="/teacher/exams/{e['id']}/results" class="btn btn-sm btn-secondary">Results</a>
-                <button class="btn btn-sm btn-danger" onclick="delExam({e['id']})">Delete</button>
-            </div></td>
-        </tr>""" for e in exams)
-
-    html = sidebar("teacher", "exams") + f"""
-    <div class="topbar"><div><div class="page-title">My Exams</div></div>
-    <a href="/teacher/exams/create" class="btn btn-primary">+ Create Exam</a></div>
-    <div class="alert-zone"></div>
-    <div class="card"><div class="table-wrap"><table>
-      <thead><tr><th>Title</th><th>Course</th><th>Questions</th><th>Duration</th><th>Submissions</th><th>Actions</th></tr></thead>
-      <tbody>{rows or '<tr><td colspan="6"><div class="empty-state"><div class="empty-icon">📝</div><p>No exams yet.</p></div></td></tr>'}</tbody>
-    </table></div></div></main></div>
-    <script>
-    function delExam(id) {{
-        if(!confirm('Delete this exam and all results?')) return;
-        fetch('/api/teacher/exams/'+id,{{method:'DELETE'}}).then(r=>r.json()).then(d=>{{
-            if(d.success) location.reload(); else showAlert(d.error);
-        }});
-    }}
-    </script>"""
-    return render(html, "My Exams")
-
-
-@teacher_bp.route("/teacher/exams/create")
-@teacher_bp.route("/teacher/exams/<int:eid>/edit")
-@login_required
-@role_required("teacher")
-def teacher_exam_editor(eid=None):
-    db = get_db()
-    courses = db.execute("SELECT * FROM courses ORDER BY course_name").fetchall()
-    exam_data = None
-    questions_json = "[]"
-    if eid:
-        exam_data = db.execute("SELECT * FROM exams WHERE id=? AND teacher_id=?", (eid, session["user_id"])).fetchone()
-        if not exam_data:
-            db.close()
-            return "Exam not found", 404
-        qs = db.execute("SELECT * FROM questions WHERE exam_id=?", (eid,)).fetchall()
-        questions_json = json.dumps([{
-            "type": q["type"], "text": q["question_text"],
-            "choices": json.loads(q["choices"]) if q["choices"] else ["","","",""],
-            "correct": q["correct_answer"], "points": q["points"]
-        } for q in qs])
+    # Fetch student's grade history
+    grades = db.execute(
+        """SELECT r.*, e.title, e.passing_score, c.course_name
+           FROM results r
+           JOIN exams e ON r.exam_id=e.id
+           JOIN courses c ON e.course_id=c.id
+           WHERE r.student_id=? ORDER BY r.id DESC""",
+        (sid,),
+    ).fetchall()
     db.close()
-    course_opts = "".join(f'<option value="{c["id"]}" {"selected" if exam_data and exam_data["course_id"]==c["id"] else ""}>{c["course_name"]}</option>' for c in courses)
 
-    html = sidebar("teacher", "exams") + f"""
-    <div class="topbar"><div><div class="page-title">{'Edit' if eid else 'Create'} Exam</div></div></div>
-    <div class="alert-zone"></div>
-    <div class="grid grid-2" style="align-items:start">
-      <div class="card">
-        <h3 class="card-title" style="margin-bottom:20px">Settings</h3>
-        <div class="form-group"><label class="form-label">Title</label><input id="examTitle" class="form-input" value="{exam_data['title'] if exam_data else ''}"></div>
-        <div class="form-group"><label class="form-label">Course</label><select id="examCourse" class="form-input form-select">{course_opts}</select></div>
-        <div class="form-group"><label class="form-label">Time Limit (mins)</label><input id="examTimer" type="number" class="form-input" value="{exam_data['timer_minutes'] if exam_data else '60'}"></div>
-        <div class="form-group"><label class="form-label">Passing Score (%)</label><input id="examPass" type="number" class="form-input" value="{exam_data['passing_score'] if exam_data else '60'}"></div>
+    avail_cards = "".join(
+        f"""<div class="card" style="margin-bottom:12px">
+      <div class="flex justify-between items-center">
+        <div><div class="font-bold">{e['title']}</div>
+             <div class="text-sm text-muted">{e['course_name']} · {e['timer_minutes']} min</div></div>
+        <a href="/student/exam/{e['id']}" class="btn btn-primary btn-sm">Take Exam</a>
+      </div></div>"""
+        for e in available
+    )
+
+    grade_rows = "".join(
+        f"""<tr><td>{g['title']}</td><td>{g['course_name']}</td>
+      <td>{g['score']:.1f}</td><td>{g['percentage']:.1f}%</td>
+      <td><span class="badge {'badge-green' if g['percentage']>=g['passing_score'] else 'badge-red'}">
+        {'Pass' if g['percentage']>=g['passing_score'] else 'Fail'}</span></td></tr>"""
+        for g in grades
+    )
+
+    html = sidebar("student", "dashboard") + f"""
+    <div class="topbar"><div><div class="page-title">My Dashboard</div><div class="page-sub">Welcome, {session.get('name')}</div></div></div>
+    <div class="grid grid-2">
+      <div>
+        <h3 style="margin-bottom:12px;font-family:'Syne',sans-serif">Available Exams ({len(available)})</h3>
+        {avail_cards or '<div class="card"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2V9l-6-6z"/><path d="M9 3v6h6"/><path d="M9 13h6"/><path d="M9 17h6"/></svg></div><p>No new exams available</p></div></div>'}
       </div>
       <div class="card">
-        <div class="flex justify-between items-center mb-16"><h3 class="card-title">Questions</h3><button class="btn btn-primary btn-sm" onclick="addQuestion()">+ Add</button></div>
-        <div id="questions-list"></div>
-        <div class="text-center text-muted" id="no-q-msg" style="padding:40px 0">No questions yet.</div>
+        <h3 class="card-title" style="margin-bottom:16px">Grade History</h3>
+        <div class="table-wrap">
+          <table><thead><tr><th>Exam</th><th>Course</th><th>Score</th><th>%</th><th>Status</th></tr></thead>
+          <tbody>{grade_rows or '<tr><td colspan="5"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19h16"/><path d="M7 15v4"/><path d="M12 11v8"/><path d="M17 7v12"/></svg></div><p>No grades yet</p></div></td></tr>'}</tbody></table>
+        </div>
       </div>
     </div>
-    <div style="margin-top:20px;text-align:right">
-      <a href="/teacher/exams" class="btn btn-secondary" style="margin-right:8px">Cancel</a>
-      <button class="btn btn-primary" onclick="saveExam()">{'Update' if eid else 'Save'} Exam</button>
-    </div></main></div>
-    <script>
-    let questions={questions_json};
-    let currentExamId={eid if eid else 'null'};
-    function addQuestion(){{questions.push({{type:'mcq',text:'',choices:['','','',''],correct:'A',points:1}});renderQuestions();}}
-    function removeQ(i){{if(confirm('Remove?')){{questions.splice(i,1);renderQuestions();}}}}
-    function renderQuestions(){{
-        const list=document.getElementById('questions-list');
-        const noMsg=document.getElementById('no-q-msg');
-        noMsg.style.display=questions.length?'none':'block';
-        list.innerHTML=questions.map((q,i)=>{{
-            let ch='';
-            if(q.type==='mcq'){{ch=`<div style="margin-top:12px"><label class="form-label">Choices</label>${{[0,1,2,3].map(ci=>`<div style="display:flex;gap:8px;margin-bottom:6px"><span style="width:24px;padding-top:10px;font-weight:700">${{'ABCD'[ci]}}</span><input class="form-input flex-1" value="${{q.choices[ci]||''}}" onchange="questions[${{i}}].choices[${{ci}}]=this.value"></div>`).join('')}}<div class="form-group"><label class="form-label">Correct</label><select class="form-input form-select" onchange="questions[${{i}}].correct=this.value">${{['A','B','C','D'].map(l=>`<option ${{q.correct===l?'selected':''}} value="${{l}}">${{l}}</option>`).join('')}}</select></div></div>`;}}
-            else if(q.type==='tf'){{ch=`<div class="form-group mt-8"><label class="form-label">Correct</label><select class="form-input form-select" onchange="questions[${{i}}].correct=this.value"><option ${{q.correct==='True'?'selected':''}} value="True">True</option><option ${{q.correct==='False'?'selected':''}} value="False">False</option></select></div>`;}}
-            else if(q.type==='identification'){{ch=`<div class="form-group mt-8"><label class="form-label">Correct Answer</label><input class="form-input" value="${{q.correct||''}}" onchange="questions[${{i}}].correct=this.value"></div>`;}}
-            return `<div class="question-card" style="margin-bottom:15px;border:1px solid #ddd;padding:15px;border-radius:8px">
-                <div style="display:flex;justify-content:space-between;margin-bottom:12px"><span style="font-weight:700;color:var(--red)">Q${{i+1}}</span><button class="btn btn-sm btn-danger" onclick="removeQ(${{i}})">Remove</button></div>
-                <div class="form-group"><label class="form-label">Type</label><select class="form-input form-select" onchange="questions[${{i}}].type=this.value;renderQuestions()"><option ${{q.type==='mcq'?'selected':''}} value="mcq">Multiple Choice</option><option ${{q.type==='tf'?'selected':''}} value="tf">True/False</option><option ${{q.type==='essay'?'selected':''}} value="essay">Essay</option><option ${{q.type==='identification'?'selected':''}} value="identification">Identification</option></select></div>
-                <div class="form-group"><label class="form-label">Question</label><textarea class="form-input" rows="2" onchange="questions[${{i}}].text=this.value">${{q.text}}</textarea></div>
-                <div class="form-group"><label class="form-label">Points</label><input type="number" class="form-input" value="${{q.points}}" min="1" onchange="questions[${{i}}].points=parseFloat(this.value)" style="max-width:120px"></div>
-                ${{ch}}</div>`;
-        }}).join('');
-    }}
-    function saveExam(){{
-        const title=document.getElementById('examTitle').value.trim();
-        const course_id=document.getElementById('examCourse').value;
-        const timer=parseInt(document.getElementById('examTimer').value);
-        const passing=parseFloat(document.getElementById('examPass').value);
-        if(!title) return showAlert('Enter exam title.');
-        if(!questions.length) return showAlert('Add at least one question.');
-        fetch('/api/teacher/exams',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-            body:JSON.stringify({{exam_id:currentExamId,title,course_id,timer_minutes:timer,passing_score:passing,questions}})}})
-        .then(r=>r.json()).then(d=>{{if(d.success){{showAlert('Saved!','success');setTimeout(()=>location.href='/teacher/exams',1000);}}else showAlert(d.error);}});
-    }}
-    renderQuestions();
-    </script>"""
-    return render(html, "Exam Editor")
+  </main></div>"""
+    return render(html, "Dashboard")
 
 
-@teacher_bp.route("/teacher/exams/<int:eid>/results")
+@student_bp.route("/student/exams")
+@student_bp.route("/student/exams/")
 @login_required
-@role_required("teacher")
-def teacher_exam_results(eid):
+@role_required("student")
+def student_exams():
     db = get_db()
-    exam = db.execute("SELECT e.*, c.course_name FROM exams e JOIN courses c ON e.course_id=c.id WHERE e.id=? AND e.teacher_id=?", (eid, session["user_id"])).fetchone()
+    sid = session["user_id"]
+
+    taken_ids = [r["exam_id"] for r in db.execute(
+        "SELECT exam_id FROM results WHERE student_id=?", (sid,)).fetchall()]
+
+    available = db.execute(
+        """SELECT e.*, c.course_name FROM exams e
+           JOIN courses c ON e.course_id=c.id
+           WHERE e.id NOT IN ({}) AND e.is_active=1
+           ORDER BY e.id DESC""".format(
+            ",".join(str(i) for i in taken_ids) if taken_ids else "0"
+        )
+    ).fetchall()
+    db.close()
+
+    avail_cards = "".join(
+        f"""<div class=\"card\" style=\"margin-bottom:12px\">\n      <div class=\"flex justify-between items-center\">\n        <div><div class=\"font-bold\">{e['title']}</div>\n             <div class=\"text-sm text-muted\">{e['course_name']} · {e['timer_minutes']} min</div></div>\n        <a href=\"/student/exam/{e['id']}\" class=\"btn btn-primary btn-sm\">Take Exam</a>\n      </div></div>"""
+        for e in available
+    )
+
+    html = sidebar("student", "exams") + f"""
+    <div class=\"topbar\"><div><div class=\"page-title\">Available Exams</div><div class=\"page-sub\">Find the next exam to take</div></div></div>
+    <div class="card">{avail_cards or '<div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2V9l-6-6z"/><path d="M9 3v6h6"/><path d="M9 13h6"/><path d="M9 17h6"/></svg></div><p>No new exams available</p></div>'}</div>
+  </main></div>"""
+    return render(html, "Available Exams")
+
+
+@student_bp.route("/student/grades")
+@login_required
+@role_required("student")
+def student_grades():
+    db = get_db()
+    grades = db.execute(
+        """SELECT r.*, e.title, e.passing_score, c.course_name
+           FROM results r
+           JOIN exams e ON r.exam_id=e.id
+           JOIN courses c ON e.course_id=c.id
+           WHERE r.student_id=? ORDER BY r.id DESC""",
+        (session["user_id"],),
+    ).fetchall()
+    db.close()
+
+    avg = sum(g["percentage"] for g in grades) / len(grades) if grades else 0
+    rows = "".join(
+        f"""<tr><td>{g['title']}</td><td>{g['course_name']}</td>
+      <td>{g['score']:.1f}</td><td>{g['percentage']:.1f}%</td>
+      <td><span class="badge {'badge-green' if g['percentage']>=g['passing_score'] else 'badge-red'}">
+        {'Pass' if g['percentage']>=g['passing_score'] else 'Fail'}</span></td>
+      <td>{g['submitted_at'][:16]}</td></tr>"""
+        for g in grades
+    )
+
+    html = sidebar("student", "grades") + f"""
+    <div class="topbar"><div><div class="page-title">My Grades</div><div class="page-sub">Overall Average: {avg:.1f}%</div></div></div>
+    <div class="card"><div class="table-wrap">
+      <table><thead><tr><th>Exam</th><th>Course</th><th>Score</th><th>Percentage</th><th>Status</th><th>Date</th></tr></thead>
+      <tbody>{rows or '<tr><td colspan="6"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19h16"/><path d="M7 15v4"/><path d="M12 11v8"/><path d="M17 7v12"/></svg></div><p>No grades yet</p></div></td></tr>'}</tbody></table>
+    </div></div>
+  </main></div>"""
+    return render(html, "My Grades")
+
+
+@student_bp.route("/student/exam/<int:eid>")
+@login_required
+@role_required("student")
+def student_take_exam(eid):
+    db = get_db()
+    sid = session["user_id"]
+
+    # Prevention: Already taken
+    already = db.execute("SELECT id FROM results WHERE student_id=? AND exam_id=?", (sid, eid)).fetchone()
+    if already:
+        db.close()
+        return render(sidebar("student", "exams") + """
+            <div class="card text-center" style="margin:40px auto;max-width:400px">
+              <div class="empty-icon" style="font-size:64px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg></div>
+              <h2 style="margin:16px 0 8px">Already Submitted</h2>
+              <p class="text-muted">You have already taken this exam. Only one attempt is allowed.</p>
+              <a href="/student" class="btn btn-primary" style="margin-top:20px">Back to Dashboard</a>
+            </div>
+            </main></div>""", "Exam")
+
+    exam = db.execute("SELECT * FROM exams WHERE id=? AND is_active=1", (eid,)).fetchone()
     if not exam:
         db.close()
         return "Exam not found", 404
-    results = db.execute("SELECT r.*, u.name, u.email FROM results r JOIN users u ON r.student_id=u.id WHERE r.exam_id=? ORDER BY r.percentage DESC", (eid,)).fetchall()
-    db.close()
-    rows = "".join(f"""<tr><td>{r['name']}</td><td>{r['email']}</td><td>{r['score']:.1f}</td><td>{r['percentage']:.1f}%</td>
-        <td><span class="badge badge-{'green' if r['percentage']>=exam['passing_score'] else 'red'}">{'Pass' if r['percentage']>=exam['passing_score'] else 'Fail'}</span></td>
-        <td>{r['submitted_at'][:16]}</td></tr>""" for r in results)
-    html = sidebar("teacher", "exams") + f"""
-    <div class="topbar"><div><div class="page-title">{exam['title']}</div><div class="page-sub">{exam['course_name']} - Passing: {exam['passing_score']}%</div></div>
-    <div style="display:flex;gap:10px"><button class="btn btn-secondary" onclick="exportPDF()">Export PDF</button><button class="btn btn-success" onclick="exportExcel()">Export Excel</button></div></div>
-    <div class="card"><div class="table-wrap"><table>
-      <thead><tr><th>Student</th><th>Email</th><th>Score</th><th>Percentage</th><th>Status</th><th>Submitted</th></tr></thead>
-      <tbody>{rows or '<tr><td colspan="6"><div class="empty-state"><div class="empty-icon">📊</div><p>No submissions yet</p></div></td></tr>'}</tbody>
-    </table></div></div></main></div>
-    <script>
-    function exportPDF(){{window.open('/api/teacher/exams/{eid}/export/pdf','_blank');}}
-    function exportExcel(){{window.open('/api/teacher/exams/{eid}/export/excel','_blank');}}
-    </script>"""
-    return render(html, "Exam Results")
 
-
-@teacher_bp.route("/teacher/essays")
-@login_required
-@role_required("teacher")
-def teacher_essays():
-    db = get_db()
-    essays = db.execute("""
-        SELECT sa.id AS answer_id, sa.answer, u.name AS student_name,
-               q.question_text, q.points AS max_points, e.title AS exam_title,
-               er.points_given, er.feedback
-        FROM student_answers sa
-        JOIN questions q ON sa.question_id=q.id
-        JOIN exams e ON q.exam_id=e.id
-        JOIN users u ON sa.student_id=u.id
-        LEFT JOIN essay_reviews er ON er.answer_id=sa.id
-        WHERE e.teacher_id=? AND q.type='essay'
-        ORDER BY sa.id DESC""", (session["user_id"],)).fetchall()
+    questions = db.execute("SELECT * FROM questions WHERE exam_id=?", (eid,)).fetchall()
+    q_list = [dict(q) for q in questions]
+    rnd.shuffle(q_list) # Randomize question order for students
     db.close()
-    cards = "".join(f"""
-    <div class="card" style="margin-bottom:16px;border-left:4px solid {'#27ae60' if e['points_given'] is not None else '#f39c12'}">
-      <div style="display:flex;justify-content:space-between;margin-bottom:12px">
-        <div><div class="font-bold">{e['student_name']}</div><div class="text-sm text-muted">{e['exam_title']}</div></div>
-        <span class="badge {'badge-green' if e['points_given'] is not None else 'badge-orange'}">{'Reviewed' if e['points_given'] is not None else 'Pending'}</span>
+
+    q_json = json.dumps(q_list)
+
+    html = sidebar("student", "exams") + f"""
+    <div class="topbar">
+      <div><div class="page-title">{exam['title']}</div><div class="page-sub">{exam['timer_minutes']} minutes · {len(q_list)} questions</div></div>
+      <div class="timer-display" id="timerDisplay">--:--</div>
+    </div>
+    <div class="grid grid-2" style="align-items:start">
+      <div id="question-area"></div>
+      <div>
+        <div class="card" style="margin-bottom:16px">
+          <h4 style="margin-bottom:12px;font-family:'Syne',sans-serif">Question Navigator</h4>
+          <div class="q-nav" id="q-nav"></div>
+          <div class="progress mt-8"><div class="progress-bar" id="q-progress" style="width:0%"></div></div>
+          <p class="text-sm text-muted mt-8"><span id="answered-count">0</span>/{len(q_list)} answered</p>
+        </div>
+        <button class="btn btn-primary w-full" onclick="submitExam()" style="margin-bottom:10px">Submit Exam</button>
       </div>
-      <div style="background:#f9f9f9;padding:12px;border-radius:6px;margin-bottom:12px"><p class="text-sm font-bold" style="color:var(--red)">{e['question_text']}</p></div>
-      <p class="text-sm" style="white-space:pre-wrap;background:#fff;border:1px solid #eee;padding:10px;border-radius:4px;margin-bottom:12px">{e['answer'] or 'No answer'}</p>
-      <div style="display:flex;gap:12px;align-items:center">
-        <div><label class="text-sm font-bold">Points (Max {e['max_points']})</label><input type="number" id="pts_{e['answer_id']}" class="form-input" value="{e['points_given'] if e['points_given'] is not None else ''}" max="{e['max_points']}" step="0.5"></div>
-        <div class="flex-1"><label class="text-sm font-bold">Feedback</label><input type="text" id="fb_{e['answer_id']}" class="form-input" value="{e['feedback'] or ''}"></div>
-        <button class="btn btn-primary" style="margin-top:18px" onclick="saveReview({e['answer_id']})">Save</button>
+    </div>
+  </main></div>
+<script>
+const EXAM_ID={eid}, TIMER_MINS={exam['timer_minutes']};
+const QUESTIONS={q_json};
+let answers={{}}, currentQ=0;
+let timerEnd=Date.now()+TIMER_MINS*60*1000;
+
+function renderQuestion(){{
+  const q=QUESTIONS[currentQ];
+  const letters='ABCDEFGH';
+  let body='';
+  if(q.type==='mcq'){{
+    const choices=JSON.parse(q.choices||'[]');
+    body=choices.map((c,i)=>`
+      <div class="choice-item ${{answers[q.id]===letters[i]?'selected':''}}" onclick="selectAnswer('${{q.id}}','${{letters[i]}}')">
+        <div class="choice-letter">${{letters[i]}}</div><div>${{c}}</div>
+      </div>`).join('');
+  }}else if(q.type==='tf'){{
+    body=['True','False'].map(v=>`
+      <div class="choice-item ${{answers[q.id]===v?'selected':''}}" onclick="selectAnswer('${{q.id}}','${{v}}')">
+        <div class="choice-letter">${{v[0]}}</div><div>${{v}}</div>
+      </div>`).join('');
+  }}else if(q.type==='identification'){{
+    body=`<input class="form-input" placeholder="Your answer" value="${{answers[q.id]||''}}" oninput="answers[q.id]=this.value">`;
+  }}
+  document.getElementById('question-area').innerHTML=`
+    <div class="question-card">
+      <div class="question-num">Question ${{currentQ+1}} of ${{QUESTIONS.length}}</div>
+      <div class="question-text">${{q.question_text}}</div>
+      ${{body}}
+      <div style="display:flex;justify-content:space-between;margin-top:20px">
+        ${{currentQ>0?'<button class="btn btn-secondary" onclick="goQ(currentQ-1)">← Previous</button>':'<span></span>'}}
+        ${{currentQ<QUESTIONS.length-1?'<button class="btn btn-primary" onclick="goQ(currentQ+1)">Next →</button>':'<button class="btn btn-success" onclick="submitExam()">Submit Exam</button>'}}
       </div>
-    </div>""" for e in essays)
-    html = sidebar("teacher", "essays") + f"""
-    <div class="topbar"><div><div class="page-title">Essay Reviews</div></div></div>
-    <div class="alert-zone"></div>
-    <div style="max-width:900px;margin:0 auto">{cards or '<div class="empty-state"><div class="empty-icon">✏️</div><p>No essays to review.</p></div>'}</div>
-    </main></div>
-    <script>
-    function saveReview(id){{
-        const pts=parseFloat(document.getElementById('pts_'+id).value);
-        const fb=document.getElementById('fb_'+id).value;
-        if(isNaN(pts)) return showAlert('Enter a score.');
-        fetch('/api/teacher/essays/'+id,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{points:pts,feedback:fb}})}})
-        .then(r=>r.json()).then(d=>{{if(d.success){{showAlert('Saved!','success');setTimeout(()=>location.reload(),800);}}else showAlert(d.error);}});
-    }}
-    </script>"""
-    return render(html, "Essays")
+    </div>`;
+  renderNav();
+}}
+function selectAnswer(qid,val){{ answers[qid]=val; renderQuestion(); }}
+function goQ(i){{ currentQ=i; renderQuestion(); }}
+function renderNav(){{
+  const nav=document.getElementById('q-nav');
+  nav.innerHTML=QUESTIONS.map((q,i)=>`<div class="q-dot ${{i===currentQ?'current':''}} ${{answers[q.id]!==undefined?'answered':''}}" onclick="goQ(${{i}})">${{i+1}}</div>`).join('');
+  const answered=Object.keys(answers).length;
+  document.getElementById('answered-count').textContent=answered;
+  document.getElementById('q-progress').style.width=(answered/QUESTIONS.length*100)+'%';
+}}
+function updateTimer(){{
+  const left=Math.max(0,timerEnd-Date.now());
+  const m=Math.floor(left/60000),s=Math.floor((left%60000)/1000);
+  document.getElementById('timerDisplay').textContent=String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
+  if(left===0)submitExam();
+}}
+function submitExam(){{
+  if(!confirm('Submit exam now?'))return;
+  fetch('/api/student/submit',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{exam_id:EXAM_ID,answers}})}})
+  .then(r=>r.json()).then(d=>{{
+    if(d.success){{
+      alert('Exam submitted successfully!');
+      location.href='/student';
+    }}else alert('Error: '+(d.error||'Submission failed'));
+  }});
+}}
+renderQuestion();
+setInterval(updateTimer,1000);
+</script>"""
+    return render(html, "Take Exam")
 
 
-@teacher_bp.route("/teacher/results")
-@login_required
-@role_required("teacher")
-def teacher_results():
-    db = get_db()
-    tid = session.get("user_id")
-    exams = db.execute("""SELECT e.*, c.course_name,(SELECT COUNT(*) FROM results r WHERE r.exam_id=e.id) AS submissions
-        FROM exams e JOIN courses c ON e.course_id=c.id WHERE e.teacher_id=? ORDER BY e.id DESC""", (tid,)).fetchall()
-    db.close()
-    links = "".join(f"""<a href="/teacher/exams/{e['id']}/results" class="stat-card" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding:20px;border:1px solid #eee">
-        <div><div style="font-weight:700">{e['title']}</div><div class="text-muted">{e['course_name']}</div></div>
-        <div style="text-align:right"><div class="stat-value">{e['submissions']}</div><div class="stat-label">Submissions</div></div></a>""" for e in exams)
-    html = sidebar("teacher", "results") + f"""
-    <div class="topbar"><div><div class="page-title">Overall Results</div></div></div>
-    <div class="card"><div class="card-header"><h3 class="card-title">My Exams</h3></div>
-    <div style="margin-top:20px">{links or '<div class="empty-state"><div class="empty-icon">📊</div><p>No exams yet.</p></div>'}</div></div></main></div>"""
-    return render(html, "Results")
-
-
+# ─────────────────────────────────────────────
 # API ROUTES
+# ─────────────────────────────────────────────
 
-@teacher_bp.route("/api/teacher/exams", methods=["POST"])
+@student_bp.route("/api/student/submit", methods=["POST"])
 @login_required
-@role_required("teacher")
-def api_save_exam():
+@role_required("student")
+def api_submit_exam():
     data = request.json
-    eid = data.get("exam_id")
-    title = (data.get("title", "")).strip()
-    course_id = data.get("course_id")
-    timer = data.get("timer_minutes", 60)
-    passing = data.get("passing_score", 60)
-    questions = data.get("questions", [])
-    if not title: return jsonify({"success": False, "error": "Title required."})
-    if not questions: return jsonify({"success": False, "error": "Add at least one question."})
+    exam_id = data.get("exam_id")
+    answers = data.get("answers", {})
+    sid = session["user_id"]
+
     db = get_db()
     try:
-        if eid:
-            db.execute("UPDATE exams SET course_id=?,title=?,timer_minutes=?,passing_score=? WHERE id=? AND teacher_id=?",
-                (course_id, title, timer, passing, eid, session["user_id"]))
-            db.execute("DELETE FROM questions WHERE exam_id=?", (eid,))
-        else:
-            cur = db.execute("INSERT INTO exams (course_id,teacher_id,title,timer_minutes,passing_score) VALUES (?,?,?,?,?)",
-                (course_id, session["user_id"], title, timer, passing))
-            eid = cur.lastrowid
+        # Check duplicate submission
+        if db.execute("SELECT id FROM results WHERE student_id=? AND exam_id=?", (sid, exam_id)).fetchone():
+            return jsonify({"error": "You have already submitted this exam."})
+
+        exam = db.execute("SELECT * FROM exams WHERE id=?", (exam_id,)).fetchone()
+        questions = db.execute("SELECT * FROM questions WHERE exam_id=?", (exam_id,)).fetchall()
+        
+        score = 0
+        total_points = sum(q["points"] for q in questions)
+
         for q in questions:
-            choices_json = json.dumps(q.get("choices", [])) if q.get("type") == "mcq" else None
-            db.execute("INSERT INTO questions (exam_id,question_text,type,choices,correct_answer,points) VALUES (?,?,?,?,?,?)",
-                (eid, q["text"], q["type"], choices_json, q.get("correct", ""), q.get("points", 1)))
+            qid = str(q["id"])
+            ans = answers.get(qid, "")
+            is_correct = 0
+            
+            if q["type"] in ["mcq", "tf", "identification"]:
+                if (q["correct_answer"] or "").strip().lower() == (ans or "").strip().lower():
+                    score += q["points"]
+                    is_correct = 1
+            
+            db.execute(
+                "INSERT INTO student_answers (student_id, exam_id, question_id, answer, is_correct) VALUES (?,?,?,?,?)",
+                (sid, exam_id, q["id"], ans, is_correct),
+            )
+
+        pct = (score / total_points * 100) if total_points > 0 else 0
+        db.execute(
+            "INSERT INTO results (student_id, exam_id, score, percentage) VALUES (?,?,?,?)",
+            (sid, exam_id, score, pct),
+        )
         db.commit()
-        return jsonify({"success": True, "exam_id": eid})
+        return jsonify({"success": True, "score": score, "percentage": pct})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return jsonify({"error": str(e)})
     finally:
         db.close()
-
-
-@teacher_bp.route("/api/teacher/exams/<int:eid>", methods=["DELETE"])
-@login_required
-@role_required("teacher")
-def api_del_exam(eid):
-    db = get_db()
-    try:
-        exam = db.execute("SELECT id FROM exams WHERE id=? AND teacher_id=?", (eid, session["user_id"])).fetchone()
-        if not exam: return jsonify({"success": False, "error": "Not found."})
-        db.execute("DELETE FROM essay_reviews WHERE answer_id IN (SELECT sa.id FROM student_answers sa JOIN questions q ON sa.question_id=q.id WHERE q.exam_id=?)", (eid,))
-        db.execute("DELETE FROM student_answers WHERE question_id IN (SELECT id FROM questions WHERE exam_id=?)", (eid,))
-        db.execute("DELETE FROM results WHERE exam_id=?", (eid,))
-        db.execute("DELETE FROM questions WHERE exam_id=?", (eid,))
-        db.execute("DELETE FROM exams WHERE id=?", (eid,))
-        db.commit()
-        return jsonify({"success": True})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
-    finally:
-        db.close()
-
-
-@teacher_bp.route("/api/teacher/essays/<int:aid>", methods=["POST"])
-@login_required
-@role_required("teacher")
-def api_review_essay(aid):
-    data = request.json
-    points = data.get("points", 0)
-    feedback = data.get("feedback", "")
-    db = get_db()
-    try:
-        existing = db.execute("SELECT id FROM essay_reviews WHERE answer_id=?", (aid,)).fetchone()
-        if existing:
-            db.execute("UPDATE essay_reviews SET points_given=?,feedback=?,teacher_id=?,reviewed_at=CURRENT_TIMESTAMP WHERE answer_id=?",
-                (points, feedback, session["user_id"], aid))
-        else:
-            db.execute("INSERT INTO essay_reviews (answer_id,teacher_id,points_given,feedback) VALUES (?,?,?,?)",
-                (aid, session["user_id"], points, feedback))
-        db.execute("UPDATE student_answers SET is_correct=? WHERE id=?", (1 if points > 0 else 0, aid))
-        info = db.execute("SELECT sa.student_id, q.exam_id FROM student_answers sa JOIN questions q ON sa.question_id=q.id WHERE sa.id=?", (aid,)).fetchone()
-        if info:
-            new_total = db.execute("""SELECT SUM(CASE WHEN q.type='essay' THEN COALESCE(er.points_given,0) WHEN sa.is_correct=1 THEN q.points ELSE 0 END) as total
-                FROM student_answers sa JOIN questions q ON sa.question_id=q.id LEFT JOIN essay_reviews er ON sa.id=er.answer_id
-                WHERE sa.student_id=? AND q.exam_id=?""", (info['student_id'], info['exam_id'])).fetchone()['total'] or 0
-            max_points = db.execute("SELECT SUM(points) FROM questions WHERE exam_id=?", (info['exam_id'],)).fetchone()[0] or 1
-            db.execute("UPDATE results SET score=?,percentage=? WHERE student_id=? AND exam_id=?",
-                (new_total, (new_total/max_points)*100, info['student_id'], info['exam_id']))
-        db.commit()
-        return jsonify({"success": True})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
-    finally:
-        db.close()
-
-
-@teacher_bp.route("/api/teacher/exams/<int:eid>/export/pdf")
-@login_required
-@role_required("teacher")
-def export_pdf(eid):
-    db = get_db()
-    try:
-        exam = db.execute("SELECT e.*, c.course_name FROM exams e JOIN courses c ON e.course_id=c.id WHERE e.id=? AND e.teacher_id=?", (eid, session["user_id"])).fetchone()
-        if not exam: return "Not found", 404
-        results = db.execute("SELECT r.*, u.name, u.email FROM results r JOIN users u ON r.student_id=u.id WHERE r.exam_id=? ORDER BY r.percentage DESC", (eid,)).fetchall()
-    finally:
-        db.close()
-    rows = "".join(f"<tr><td>{r['name']}</td><td>{r['email']}</td><td>{r['score']:.1f}</td><td>{r['percentage']:.1f}%</td><td style='color:{'green' if r['percentage']>=exam['passing_score'] else 'red'}'>{'Pass' if r['percentage']>=exam['passing_score'] else 'Fail'}</td></tr>" for r in results)
-    html = f"""<html><head><style>body{{font-family:sans-serif}}table{{width:100%;border-collapse:collapse}}th,td{{border:1px solid #ddd;padding:8px}}</style></head>
-    <body><h1>{exam['title']}</h1><p>{exam['course_name']} | Passing: {exam['passing_score']}%</p>
-    <table><thead><tr><th>Name</th><th>Email</th><th>Score</th><th>%</th><th>Status</th></tr></thead>
-    <tbody>{rows or '<tr><td colspan="5">No results.</td></tr>'}</tbody></table>
-    <p style="color:gray;font-size:.8em">Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}</p></body></html>"""
-    resp = make_response(html)
-    resp.headers["Content-Type"] = "text/html"
-    resp.headers["Content-Disposition"] = f'inline; filename="results_{eid}.html"'
-    return resp
-
-
-@teacher_bp.route("/api/teacher/exams/<int:eid>/export/excel")
-@login_required
-@role_required("teacher")
-def export_excel(eid):
-    db = get_db()
-    try:
-        exam = db.execute("SELECT passing_score FROM exams WHERE id=? AND teacher_id=?", (eid, session["user_id"])).fetchone()
-        if not exam: return "Not found", 404
-        results = db.execute("SELECT r.*, u.name, u.email FROM results r JOIN users u ON r.student_id=u.id WHERE r.exam_id=? ORDER BY r.percentage DESC", (eid,)).fetchall()
-    finally:
-        db.close()
-    lines = ["Name,Email,Score,Percentage,Status,Submitted At"]
-    for r in results:
-        status = "Pass" if r["percentage"] >= exam["passing_score"] else "Fail"
-        lines.append(f'"{r["name"]}","{r["email"]}",{r["score"]:.1f},{r["percentage"]:.1f}%,{status},"{r["submitted_at"][:16]}"')
-    resp = make_response("\n".join(lines))
-    resp.headers["Content-Type"] = "text/csv"
-    resp.headers["Content-Disposition"] = f'attachment; filename="results_{eid}.csv"'
-    return resp
